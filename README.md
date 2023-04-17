@@ -1,0 +1,1 @@
+This crate provides an interface between the miette crate and the syntect crate, allowing your miette error reports to have syntax highlighting with terminal colors.
