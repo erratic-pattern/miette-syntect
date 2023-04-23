@@ -1,71 +1,161 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, fs::File, io::Read, path::Path};
 
 use miette::{MietteSpanContents, SourceCode, SourceSpan};
 
 use syntect::{
-    highlighting::{HighlightIterator, HighlightState, Highlighter, Style, Theme},
-    parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet},
+    highlighting::{Theme, ThemeSet},
+    parsing::{Scope, SyntaxReference, SyntaxSet},
 };
 
-#[derive(Debug)]
-pub struct HighlightedSource<'s> {
-    // reference to incoming source
-    source: &'s str,
-    // output source with or without highlight
-    data: Cow<'s, str>,
+use crate::highlight::highlight_lines;
+
+// trait object for syntects family of find_syntax_* functions
+type SyntaxFinder = Box<dyn for<'a> FnOnce(&'a SyntaxSet) -> Option<&'a SyntaxReference>>;
+
+pub struct HighlightedSourceBuilder<'s, 'ss, 't> {
+    source: Cow<'s, str>,
+    syntax_set: Option<Cow<'ss, SyntaxSet>>,
+    find_syntax_fn: Option<SyntaxFinder>,
+    theme: Option<Cow<'t, Theme>>,
+    force_color: Option<bool>,
+    use_bg_color: Option<bool>,
+    name: Option<String>,
 }
 
-impl<'s> HighlightedSource<'s> {
-    fn no_color(source: &'s str) -> Self {
+impl<'s, 'ss, 't> HighlightedSourceBuilder<'s, 'ss, 't> {
+    pub fn from_string<S: Into<Cow<'s, str>>>(source: S) -> Self {
+        let source = source.into();
         Self {
             source,
-            data: Cow::Borrowed(source),
+            syntax_set: None,
+            find_syntax_fn: None,
+            theme: None,
+            force_color: None,
+            use_bg_color: None,
+            name: None,
         }
     }
-    fn with_color(
-        source: &'s str,
+
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, std::io::Error> {
+        let path = path.as_ref();
+        let mut source = String::new();
+        let mut file = File::open(path)?;
+        file.read_to_string(&mut source)?;
+        let mut builder = Self::from_string(Cow::Owned(source));
+        if let Some(path) = path.to_str() {
+            builder.name = Some(path.to_string());
+            builder.find_syntax_fn = Some(Box::new({
+                let name = path.to_string();
+                move |ss| ss.find_syntax_for_file(name).ok().flatten()
+            }));
+        }
+
+        Ok(builder)
+    }
+
+    pub fn syntax_set<SS: Into<Cow<'ss, SyntaxSet>>>(mut self, syntax_set: SS) -> Self {
+        self.syntax_set = Some(syntax_set.into());
+        self
+    }
+
+    pub fn theme<T: Into<Cow<'t, Theme>>>(mut self, theme: T) -> Self {
+        self.theme = Some(theme.into());
+        self
+    }
+
+    pub fn name<N: Into<String>>(mut self, name: N) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn force_color(mut self, flag: bool) -> Self {
+        self.force_color = Some(flag);
+        self
+    }
+
+    pub fn use_bg_color(mut self, flag: bool) -> Self {
+        self.use_bg_color = Some(flag);
+        self
+    }
+
+    pub fn default_syntax_set_newlines(mut self) -> Self {
+        self.syntax_set = Some(Cow::Owned(SyntaxSet::load_defaults_newlines()));
+        self
+    }
+
+    pub fn default_syntax_set_nonewlines(mut self) -> Self {
+        self.syntax_set = Some(Cow::Owned(SyntaxSet::load_defaults_nonewlines()));
+        self
+    }
+
+    pub fn find_syntax_by_extension(mut self, ext: &str) -> Self {
+        let ext = ext.to_string();
+        self.find_syntax_fn = Some(Box::new(move |ss| ss.find_syntax_by_extension(&ext)));
+        self
+    }
+
+    pub fn find_syntax_by_name(mut self, name: &str) -> Self {
+        let name = name.to_string();
+        self.find_syntax_fn = Some(Box::new(move |ss| ss.find_syntax_by_name(&name)));
+        self
+    }
+
+    pub fn find_syntax_by_scope(mut self, scope: Scope) -> Self {
+        self.find_syntax_fn = Some(Box::new(move |ss| ss.find_syntax_by_scope(scope)));
+        self
+    }
+
+    pub fn build(self) -> HighlightedSource {
+        let ss = self
+            .syntax_set
+            .unwrap_or_else(|| Cow::Owned(SyntaxSet::load_defaults_newlines()));
+        let find_syntax_fn = self
+            .find_syntax_fn
+            .unwrap_or_else(|| Box::new(|ss| ss.find_syntax_by_first_line(&self.source)));
+        let theme = self.theme.unwrap_or_else(|| {
+            Cow::Owned(
+                ThemeSet::load_defaults()
+                    .themes
+                    .into_values()
+                    .next()
+                    .unwrap(),
+            )
+        });
+        let syntax = find_syntax_fn(&ss).unwrap_or_else(|| ss.find_syntax_plain_text());
+        let use_bg_color = self.use_bg_color.unwrap_or(false);
+        HighlightedSource::new(&self.source, &ss, syntax, &theme, use_bg_color, self.name)
+    }
+}
+
+#[derive(Debug)]
+pub struct HighlightedSource {
+    // reference to incoming source
+    highlighted_source: String,
+    name: Option<String>,
+}
+
+impl HighlightedSource {
+    fn new(
+        source: &str,
         syntax_set: &SyntaxSet,
         syntax_ref: &SyntaxReference,
         theme: &Theme,
         use_bg_color: bool,
+        name: Option<String>,
     ) -> Self {
-        let highlighter = Highlighter::new(theme);
-        // parse source and highlight span contents
-        let mut highlight_state = HighlightState::new(&highlighter, ScopeStack::new());
-        let mut parse_state = ParseState::new(syntax_ref);
-        let mut data = source
-            .lines()
-            .map(|line| {
-                let ops = parse_state.parse_line(line, syntax_set).unwrap();
-
-                let regions: Vec<(Style, &str)> =
-                    HighlightIterator::new(&mut highlight_state, &ops, line, &highlighter)
-                        .collect();
-                syntect::util::as_24_bit_terminal_escaped(&regions, use_bg_color)
-            })
+        let highlighted_source = highlight_lines(source, syntax_set, syntax_ref, theme)
+            .map(|regions| syntect::util::as_24_bit_terminal_escaped(&regions, use_bg_color))
             .collect::<Vec<String>>()
             .join("\n");
-        // clear colors at end
-        data.push_str("\x1b[0m");
+        // parse source and highlight span contents
         Self {
-            source,
-            data: Cow::Owned(data),
+            highlighted_source,
+            name,
         }
     }
-
-    // fn use_color(&self) -> bool {
-    //     self.force_color.unwrap_or_else(|| {
-    //         env::var_os("NO_COLOR") != Some("0".into())
-    //             && env::var_os("NO_GRAPHICS") != Some("0".into())
-    //     })
-    // }
-
-    // fn use_bg_color(&self) -> bool {
-    //     self.use_bg_color.unwrap_or(false)
-    // }
 }
 
-impl<'s> SourceCode for HighlightedSource<'s> {
+impl SourceCode for HighlightedSource {
     fn read_span<'a>(
         &'a self,
         span: &SourceSpan,
@@ -73,10 +163,10 @@ impl<'s> SourceCode for HighlightedSource<'s> {
         context_lines_after: usize,
     ) -> Result<Box<dyn miette::SpanContents<'a> + 'a>, miette::MietteError> {
         let span_contents =
-            self.source
+            self.highlighted_source
                 .read_span(span, context_lines_before, context_lines_after)?;
         Ok(Box::new(MietteSpanContents::new(
-            self.data.as_bytes(),
+            span_contents.data(),
             *span_contents.span(),
             span_contents.line(),
             span_contents.column(),
@@ -85,38 +175,27 @@ impl<'s> SourceCode for HighlightedSource<'s> {
     }
 }
 
-// TODO: HighlightedSourceFile with syntax set handling, name handling, and buffered reading
-// impl<'s> HighlightedSource<'s>  {
-//     pub fn from_file<P: AsRef<Path>>(path: P, syntax_set: &'syn SyntaxSet, theme: &'syn Theme) -> Result<Self, io::Error> {
-//         let path = path.as_ref();
-//         let f = File::open(path)?;
-//         let syntax = syntax_set.find_syntax_for_file(path)?
-//             .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
-//         Ok(Self::new(f, syntax_set, syntax, theme).with_name(path.to_string_lossy()))
-//     }
-// }
-
 #[cfg(test)]
 mod test {
 
-    use miette::{Diagnostic, MietteHandlerOpts, Report, SourceOffset, SourceSpan};
-    use syntect::{highlighting::ThemeSet, parsing::SyntaxSet};
+    use miette::{Diagnostic, IntoDiagnostic, MietteHandlerOpts, Report, SourceOffset, SourceSpan};
+
     use thiserror::Error;
 
-    use crate::HighlightedSource;
+    use crate::{highlighted_source::HighlightedSourceBuilder, HighlightedSource};
 
     #[derive(Error, Debug, Diagnostic)]
     #[error("test error")]
     #[diagnostic()]
-    struct BasicReport<'s> {
+    struct BasicReport {
         #[source_code]
-        src: HighlightedSource<'s>,
+        src: HighlightedSource,
         #[label("test label")]
         span: SourceSpan,
     }
 
     #[test]
-    fn basic_report_rendering() {
+    fn default_report_zero_context_lines() {
         miette::set_hook(Box::new(|_| {
             Box::new(
                 MietteHandlerOpts::new()
@@ -131,15 +210,11 @@ mod test {
                 println!(\"Hello, World!\");
             }
         "#;
-        let ss = SyntaxSet::load_defaults_newlines();
-        let sr = ss.find_syntax_by_extension("rs").unwrap();
-        let ts = ThemeSet::load_defaults();
-        let theme = ts.themes.values().next().unwrap();
-        let loc = SourceOffset::from_location(code, 2, 0);
-        let report = BasicReport {
-            src: HighlightedSource::with_color(code, &ss, sr, theme, false),
-            span: SourceSpan::new(loc, SourceOffset::from(loc.offset() + 10)),
-        };
+        let src = HighlightedSourceBuilder::from_string(code).build();
+
+        let loc = SourceOffset::from_location(code, 3, 0);
+        let span = (loc, 10.into()).into();
+        let report = BasicReport { src, span };
         println!("{:?}", Report::new(report))
 
         // println!("{:?}", report);
