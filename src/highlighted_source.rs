@@ -7,7 +7,7 @@ use syntect::{
     parsing::{Scope, SyntaxReference, SyntaxSet},
 };
 
-use crate::highlight::highlight_lines;
+use crate::{highlight::highlight_lines, source_context::context_info};
 
 // trait object for syntects family of find_syntax_* functions
 type SyntaxFinder = Box<dyn for<'a> FnOnce(&'a SyntaxSet) -> Option<&'a SyntaxReference>>;
@@ -143,10 +143,10 @@ impl HighlightedSource {
         use_bg_color: bool,
         name: Option<String>,
     ) -> Self {
-        let highlighted_source = highlight_lines(source, syntax_set, syntax_ref, theme)
-            .map(|regions| syntect::util::as_24_bit_terminal_escaped(&regions, use_bg_color))
-            .collect::<Vec<String>>()
-            .join("\n");
+        let mut highlighted_source =
+            highlight_lines(source, syntax_set, syntax_ref, theme, use_bg_color)
+                .collect::<Vec<String>>()
+                .join("\n");
         // parse source and highlight span contents
         Self {
             highlighted_source,
@@ -162,23 +162,20 @@ impl SourceCode for HighlightedSource {
         context_lines_before: usize,
         context_lines_after: usize,
     ) -> Result<Box<dyn miette::SpanContents<'a> + 'a>, miette::MietteError> {
-        let span_contents =
-            self.highlighted_source
-                .read_span(span, context_lines_before, context_lines_after)?;
-        Ok(Box::new(MietteSpanContents::new(
-            span_contents.data(),
-            *span_contents.span(),
-            span_contents.line(),
-            span_contents.column(),
-            span_contents.line_count(),
-        )))
+        let span_contents = context_info(
+            self.highlighted_source.as_bytes(),
+            span,
+            context_lines_before,
+            context_lines_after,
+        )?;
+        Ok(Box::new(span_contents))
     }
 }
 
 #[cfg(test)]
 mod test {
 
-    use miette::{Diagnostic, IntoDiagnostic, MietteHandlerOpts, Report, SourceOffset, SourceSpan};
+    use miette::{Diagnostic, MietteHandlerOpts, Report, SourceOffset, SourceSpan};
 
     use thiserror::Error;
 
@@ -200,20 +197,21 @@ mod test {
             Box::new(
                 MietteHandlerOpts::new()
                     .force_graphical(true)
-                    .context_lines(0)
+                    .context_lines(1)
                     .build(),
             )
         }))
         .unwrap();
-        let code = r#"
-            fn main() {
-                println!(\"Hello, World!\");
-            }
-        "#;
-        let src = HighlightedSourceBuilder::from_string(code).build();
+        let code = r#"fn main() {
+    println!("Hello, World!");
+}"#;
+        let src = HighlightedSourceBuilder::from_string(code)
+            .find_syntax_by_extension("rs")
+            .build();
 
-        let loc = SourceOffset::from_location(code, 3, 0);
-        let span = (loc, 10.into()).into();
+        let loc = SourceOffset::from_location(code, 3, 4);
+        println!("{:?}", loc);
+        let span = (loc, 4.into()).into();
         let report = BasicReport { src, span };
         println!("{:?}", Report::new(report))
 

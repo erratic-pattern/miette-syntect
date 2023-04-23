@@ -10,6 +10,7 @@ license = "MIT"
 [dependencies]
 bumpalo = "3.12.1"
 indexmap = "1.9.3"
+itertools = "0.10.5"
 miette = "5.7"
 once_cell = "1.17.1"
 shared_arena = "0.8.4"
